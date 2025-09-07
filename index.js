@@ -9,6 +9,7 @@ import chalk from 'chalk';
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.set('trust proxy', 1);
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
@@ -25,6 +26,7 @@ app.get('/', (req, res) => {
 
 app.post('/api/validate', async (req, res) => {
     const { licenseKey } = req.body;
+    const userIp = req.ip;
 
     if (!licenseKey) {
         return res.status(400).json({ valid: false, message: 'License key is required.' });
@@ -33,7 +35,7 @@ app.post('/api/validate', async (req, res) => {
     try {
         const { data, error } = await supabase
             .from('licenses')
-            .select('status')
+            .select('status, current_ip')
             .eq('key', licenseKey)
             .single();
 
@@ -42,12 +44,31 @@ app.post('/api/validate', async (req, res) => {
             return res.status(404).json({ valid: false, message: 'License key not found.' });
         }
 
-        if (data.status === 'active') {
-            console.log(`Validation successful for key: ${licenseKey}`);
-            return res.json({ valid: true });
-        } else {
+        if (data.status !== 'active') {
             console.log(`Validation failed for key ${licenseKey}, status: ${data.status}`);
             return res.status(403).json({ valid: false, message: `License key is inactive (status: ${data.status}).` });
+        }
+
+        if (data.current_ip === null) {
+            const { error: updateError } = await supabase
+                .from('licenses')
+                .update({ current_ip: userIp })
+                .eq('key', licenseKey);
+
+            if (updateError) {
+                console.error('Error updating IP:', updateError);
+                throw new Error('Failed to register IP address.');
+            }
+            console.log(`IP ${userIp} registered for key: ${licenseKey}`);
+            return res.json({ valid: true, message: 'IP address registered successfully.' });
+        }
+
+        if (data.current_ip === userIp) {
+            console.log(`Successful validation for key: ${licenseKey} from IP: ${userIp}`);
+            return res.json({ valid: true });
+        } else {
+            console.log(`Validation failed for key ${licenseKey}. Stored IP: ${data.current_ip}, Request IP: ${userIp}`);
+            return res.status(403).json({ valid: false, message: 'This license key is in use by another IP address.' });
         }
 
     } catch (err) {
@@ -81,7 +102,7 @@ bot.onText(/\/list/, async (msg) => {
         response += 'No licenses found.';
     } else {
         data.forEach(lic => {
-            response += `Key: \`${lic.key}\`\nStatus: \`${lic.status}\`\n\n`;
+            response += `Key: \`${lic.key}\`\nStatus: \`${lic.status}\`\nIP: \`${lic.current_ip || 'Not set'}\`\n\n`;
         });
     }
     bot.sendMessage(adminChatId, response, { parse_mode: 'Markdown' });
@@ -93,6 +114,13 @@ bot.onText(/\/status (.+) (.+)/, async (msg, match) => {
     const newStatus = match[2];
     const { error } = await supabase.from('licenses').update({ status: newStatus }).eq('key', key);
     bot.sendMessage(adminChatId, error ? `Error: ${error.message}` : `Key \`${key}\` status updated to \`${newStatus}\`.`, { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/reset_ip (.+)/, async (msg, match) => {
+    if (!isAdmin(msg.chat.id)) return;
+    const key = match[1];
+    const { error } = await supabase.from('licenses').update({ current_ip: null }).eq('key', key);
+    bot.sendMessage(adminChatId, error ? `Error: ${error.message}` : `IP for key \`${key}\` has been reset.`, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/delete (.+)/, async (msg, match) => {
@@ -110,7 +138,7 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, async () => {
     console.log(`License server listening on port ${PORT}`);
     try {
-        await bot.sendMessage(adminChatId, "✅ License Bot is now online and connected.");
+        await bot.sendMessage(adminChatId, "✅ License Bot (IP-based) is now online and connected.");
         console.log(chalk.green("Successfully sent startup message to Telegram admin."));
     } catch (error) {
         console.log(chalk.red.bold('\n[!] Warning: Could not send startup message to Telegram.'));
