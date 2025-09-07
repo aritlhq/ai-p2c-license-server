@@ -17,17 +17,18 @@ const adminChatId = parseInt(process.env.TELEGRAM_ADMIN_CHAT_ID, 10);
 
 const bot = new TelegramBot(botToken);
 
-const vercelUrl = process.env.VERCEL_URL;
-const webhookUrl = `https://${vercelUrl}/api/server`;
-bot.setWebHook(webhookUrl);
+if (process.env.VERCEL_URL) {
+    const webhookUrl = `https://${process.env.VERCEL_URL}/api`;
+    bot.setWebHook(webhookUrl);
+}
 
-app.post(`/api/server`, (req, res) => {
+app.post('/api', (req, res) => {
     bot.processUpdate(req.body);
     res.sendStatus(200);
 });
 
 app.get('/', (req, res) => {
-    res.send('License Server is running and webhook is set.');
+    res.send('License Server is running.');
 });
 
 app.post('/api/validate', async (req, res) => {
