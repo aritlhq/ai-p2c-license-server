@@ -18,17 +18,66 @@ const adminChatId = parseInt(process.env.TELEGRAM_ADMIN_CHAT_ID, 10);
 
 const bot = new TelegramBot(botToken);
 
-if (process.env.VERCEL_URL) {
-    const webhookUrl = `https://${process.env.VERCEL_URL}/api/webhook`;
-    bot.setWebHook(webhookUrl);
-}
+const isAdmin = (chatId) => chatId === adminChatId;
+
+const handleTelegramCommand = async (msg) => {
+    const text = msg.text;
+    const chatId = msg.chat.id;
+
+    if (!isAdmin(chatId)) {
+        return bot.sendMessage(chatId, "You are not authorized.");
+    }
+
+    if (text.startsWith('/create')) {
+        const newKey = uuidv4();
+        const { error } = await supabase.from('licenses').insert([{ key: newKey, status: 'active' }]);
+        return bot.sendMessage(adminChatId, error ? `Error: ${error.message}` : `New key created successfully:\n\n\`${newKey}\``, { parse_mode: 'Markdown' });
+    }
+
+    if (text.startsWith('/list')) {
+        const { data, error } = await supabase.from('licenses').select('*');
+        if (error) return bot.sendMessage(adminChatId, `Error: ${error.message}`);
+        let response = '📜 **License List** 📜\n\n';
+        if (!data || data.length === 0) {
+            response += 'No licenses found.';
+        } else {
+            data.forEach(lic => {
+                response += `Key: \`${lic.key}\`\nStatus: \`${lic.status}\`\n\n`;
+            });
+        }
+        return bot.sendMessage(adminChatId, response, { parse_mode: 'Markdown' });
+    }
+
+    const statusMatch = text.match(/\/status (.+) (.+)/);
+    if (statusMatch) {
+        const key = statusMatch[1];
+        const newStatus = statusMatch[2];
+        const { error } = await supabase.from('licenses').update({ status: newStatus }).eq('key', key);
+        return bot.sendMessage(adminChatId, error ? `Error: ${error.message}` : `Key \`${key}\` status updated to \`${newStatus}\`.`, { parse_mode: 'Markdown' });
+    }
+    
+    const deleteMatch = text.match(/\/delete (.+)/);
+    if (deleteMatch) {
+        const key = deleteMatch[1];
+        const { error } = await supabase.from('licenses').delete().eq('key', key);
+        return bot.sendMessage(adminChatId, error ? `Error: ${error.message}` : `Key \`${key}\` has been deleted.`, { parse_mode: 'Markdown' });
+    }
+
+    return bot.sendMessage(adminChatId, "Unknown command.");
+};
 
 app.get('/', (req, res) => {
     res.send('License Server is running.');
 });
 
-app.post('/api/webhook', (req, res) => {
-    bot.processUpdate(req.body);
+app.post('/api/webhook', async (req, res) => {
+    try {
+        if (req.body && req.body.message) {
+            await handleTelegramCommand(req.body.message);
+        }
+    } catch (error) {
+        console.error("Error processing webhook:", error);
+    }
     res.sendStatus(200);
 });
 
@@ -50,45 +99,6 @@ app.post('/api/validate', async (req, res) => {
     } catch (err) {
         return res.status(500).json({ valid: false, message: 'An internal server error occurred.' });
     }
-});
-
-const isAdmin = (chatId) => chatId === adminChatId;
-
-bot.onText(/\/create/, async (msg) => {
-    if (!isAdmin(msg.chat.id)) return bot.sendMessage(msg.chat.id, "You are not authorized.");
-    const newKey = uuidv4();
-    const { error } = await supabase.from('licenses').insert([{ key: newKey, status: 'active' }]);
-    bot.sendMessage(adminChatId, error ? `Error: ${error.message}` : `New key created successfully:\n\n\`${newKey}\``, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/list/, async (msg) => {
-    if (!isAdmin(msg.chat.id)) return;
-    const { data, error } = await supabase.from('licenses').select('*');
-    if (error) return bot.sendMessage(adminChatId, `Error: ${error.message}`);
-    let response = '📜 **License List** 📜\n\n';
-    if (data.length === 0) {
-        response += 'No licenses found.';
-    } else {
-        data.forEach(lic => {
-            response += `Key: \`${lic.key}\`\nStatus: \`${lic.status}\`\n\n`;
-        });
-    }
-    bot.sendMessage(adminChatId, response, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/status (.+) (.+)/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
-    const key = match[1];
-    const newStatus = match[2];
-    const { error } = await supabase.from('licenses').update({ status: newStatus }).eq('key', key);
-    bot.sendMessage(adminChatId, error ? `Error: ${error.message}` : `Key \`${key}\` status updated to \`${newStatus}\`.`, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/delete (.+)/, async (msg, match) => {
-    if (!isAdmin(msg.chat.id)) return;
-    const key = match[1];
-    const { error } = await supabase.from('licenses').delete().eq('key', key);
-    bot.sendMessage(adminChatId, error ? `Error: ${error.message}` : `Key \`${key}\` has been deleted.`, { parse_mode: 'Markdown' });
 });
 
 export default app;
