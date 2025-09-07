@@ -17,8 +17,9 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 
 const botToken = process.env.TELEGRAM_BOT_TOKEN;
 const adminChatId = parseInt(process.env.TELEGRAM_ADMIN_CHAT_ID, 10);
-
 const bot = new TelegramBot(botToken, { polling: true });
+
+const SESSION_TIMEOUT_MINUTES = 60;
 
 app.get('/', (req, res) => {
     res.send('License Server is running.');
@@ -35,41 +36,36 @@ app.post('/api/validate', async (req, res) => {
     try {
         const { data, error } = await supabase
             .from('licenses')
-            .select('status, current_ip')
+            .select('status, current_ip, last_seen_at')
             .eq('key', licenseKey)
             .single();
 
         if (error || !data) {
-            console.log(`Validation failed for key: ${licenseKey}`);
             return res.status(404).json({ valid: false, message: 'License key not found.' });
         }
 
         if (data.status !== 'active') {
-            console.log(`Validation failed for key ${licenseKey}, status: ${data.status}`);
             return res.status(403).json({ valid: false, message: `License key is inactive (status: ${data.status}).` });
         }
 
-        if (data.current_ip === null) {
-            const { error: updateError } = await supabase
-                .from('licenses')
-                .update({ current_ip: userIp })
-                .eq('key', licenseKey);
+        const now = new Date();
+        const lastSeen = data.last_seen_at ? new Date(data.last_seen_at) : null;
+        const minutesSinceLastSeen = lastSeen ? (now - lastSeen) / (1000 * 60) : Infinity;
 
-            if (updateError) {
-                console.error('Error updating IP:', updateError);
-                throw new Error('Failed to register IP address.');
-            }
-            console.log(`IP ${userIp} registered for key: ${licenseKey}`);
-            return res.json({ valid: true, message: 'IP address registered successfully.' });
+        if (data.current_ip && data.current_ip !== userIp && minutesSinceLastSeen < SESSION_TIMEOUT_MINUTES) {
+            return res.status(403).json({ valid: false, message: `License is currently active on another network. Please try again in an hour.` });
         }
 
-        if (data.current_ip === userIp) {
-            console.log(`Successful validation for key: ${licenseKey} from IP: ${userIp}`);
-            return res.json({ valid: true });
-        } else {
-            console.log(`Validation failed for key ${licenseKey}. Stored IP: ${data.current_ip}, Request IP: ${userIp}`);
-            return res.status(403).json({ valid: false, message: 'This license key is in use by another IP address.' });
+        const { error: updateError } = await supabase
+            .from('licenses')
+            .update({ current_ip: userIp, last_seen_at: now.toISOString() })
+            .eq('key', licenseKey);
+
+        if (updateError) {
+            throw new Error('Failed to update license session.');
         }
+
+        return res.json({ valid: true });
 
     } catch (err) {
         console.error('Server error during validation:', err);
@@ -77,19 +73,26 @@ app.post('/api/validate', async (req, res) => {
     }
 });
 
+app.post('/api/heartbeat', async (req, res) => {
+    const { licenseKey } = req.body;
+    if (!licenseKey) return res.sendStatus(400);
+
+    const now = new Date();
+    await supabase
+        .from('licenses')
+        .update({ last_seen_at: now.toISOString() })
+        .eq('key', licenseKey);
+    
+    res.sendStatus(200);
+});
+
 const isAdmin = (chatId) => chatId === adminChatId;
 
 bot.onText(/\/create/, async (msg) => {
     if (!isAdmin(msg.chat.id)) return bot.sendMessage(msg.chat.id, "You are not authorized.");
-
     const newKey = uuidv4();
     const { error } = await supabase.from('licenses').insert([{ key: newKey, status: 'active' }]);
-
-    if (error) {
-        bot.sendMessage(adminChatId, `Error creating key: ${error.message}`);
-    } else {
-        bot.sendMessage(adminChatId, `New key created successfully:\n\n\`${newKey}\``, { parse_mode: 'Markdown' });
-    }
+    bot.sendMessage(adminChatId, error ? `Error: ${error.message}` : `New key created successfully:\n\n\`${newKey}\``, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/list/, async (msg) => {
@@ -102,7 +105,8 @@ bot.onText(/\/list/, async (msg) => {
         response += 'No licenses found.';
     } else {
         data.forEach(lic => {
-            response += `Key: \`${lic.key}\`\nStatus: \`${lic.status}\`\nIP: \`${lic.current_ip || 'Not set'}\`\n\n`;
+            const lastSeen = lic.last_seen_at ? new Date(lic.last_seen_at).toLocaleString('en-US') : 'Never';
+            response += `Key: \`${lic.key}\`\nStatus: \`${lic.status}\`\nIP: \`${lic.current_ip || 'Not set'}\`\nLast Seen: \`${lastSeen}\`\n\n`;
         });
     }
     bot.sendMessage(adminChatId, response, { parse_mode: 'Markdown' });
@@ -116,11 +120,11 @@ bot.onText(/\/status (.+) (.+)/, async (msg, match) => {
     bot.sendMessage(adminChatId, error ? `Error: ${error.message}` : `Key \`${key}\` status updated to \`${newStatus}\`.`, { parse_mode: 'Markdown' });
 });
 
-bot.onText(/\/reset_ip (.+)/, async (msg, match) => {
+bot.onText(/\/reset_session (.+)/, async (msg, match) => {
     if (!isAdmin(msg.chat.id)) return;
     const key = match[1];
-    const { error } = await supabase.from('licenses').update({ current_ip: null }).eq('key', key);
-    bot.sendMessage(adminChatId, error ? `Error: ${error.message}` : `IP for key \`${key}\` has been reset.`, { parse_mode: 'Markdown' });
+    const { error } = await supabase.from('licenses').update({ current_ip: null, last_seen_at: null }).eq('key', key);
+    bot.sendMessage(adminChatId, error ? `Error: ${error.message}` : `Session for key \`${key}\` has been reset.`, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/delete (.+)/, async (msg, match) => {
@@ -138,11 +142,9 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, async () => {
     console.log(`License server listening on port ${PORT}`);
     try {
-        await bot.sendMessage(adminChatId, "✅ License Bot (IP-based) is now online and connected.");
+        await bot.sendMessage(adminChatId, "✅ License Bot (Heartbeat-based) is now online and connected.");
         console.log(chalk.green("Successfully sent startup message to Telegram admin."));
     } catch (error) {
         console.log(chalk.red.bold('\n[!] Warning: Could not send startup message to Telegram.'));
-        console.log(chalk.yellow('Please ensure you have started a chat with your bot from your admin account.'));
-        console.log(chalk.gray('The server will continue to run, but you will not receive notifications until this is fixed.'));
     }
 });
